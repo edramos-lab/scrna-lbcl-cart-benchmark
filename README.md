@@ -9,11 +9,11 @@ CAR-T clinical atlas (Haradhvala et al., *Nature Medicine* 2022).
 
 | Path | Description |
 |------|-------------|
-| `main.tex` | Elsevier (`elsarticle`) manuscript source |
-| `references.bib` | Bibliography (verified via OpenAlex + scite) |
-| `main.pdf` | Compiled manuscript |
 | `images/` | Figures (Green AI Pareto, t-SNE, XAI, power traces) |
 | `scripts/scrna_seq_for_lbcl.py` | End-to-end CLI pipeline (data → benchmark → Optuna HPO → XAI) |
+
+> The manuscript (LaTeX source, bibliography, and compiled PDF) is maintained separately and is
+> not tracked in this repository.
 
 ## Pipeline script
 
@@ -38,12 +38,6 @@ python scripts/scrna_seq_for_lbcl.py \
 Key flags: `--gpu-power-watts` (T4=70, V100=300, A100=400), `--tune-model`, `--n-trials`,
 `--skip-download` (reuse data on re-runs), `--power-monitor`, `--skip-gpu-tsne`.
 Run `python scripts/scrna_seq_for_lbcl.py --help` for the full list.
-
-## Build the manuscript
-
-```bash
-latexmk -pdf main.tex
-```
 
 ## Data
 

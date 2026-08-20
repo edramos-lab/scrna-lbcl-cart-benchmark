@@ -19,6 +19,11 @@ GSE197268_data/
 *.mtx
 *.mtx.gz
 
+# --- Manuscript (kept local, not tracked in this repo) ---
+main.tex
+references.bib
+main.pdf
+
 # --- Pipeline outputs (figures, generated at runtime) ---
 outputs/
 
