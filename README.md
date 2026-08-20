@@ -49,6 +49,10 @@ latexmk -pdf main.tex
 
 The GSE197268 raw data (~GBs) is **not** included; the script downloads it from NCBI GEO at runtime.
 
+## License
+
+Code is released under the [MIT License](LICENSE).
+
 ## Citation
 
 Primary dataset: Haradhvala, N. J., Leick, M. B., Maurer, K., et al. (2022). Distinct cellular

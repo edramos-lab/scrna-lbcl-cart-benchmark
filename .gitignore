@@ -19,6 +19,9 @@ GSE197268_data/
 *.mtx
 *.mtx.gz
 
+# --- Pipeline outputs (figures, generated at runtime) ---
+outputs/
+
 # --- Optuna study / model artifacts ---
 *.db
 *.pt
