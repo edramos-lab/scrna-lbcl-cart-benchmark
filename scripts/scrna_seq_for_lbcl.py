@@ -486,6 +486,27 @@ print(f"🔎 Optuna search on '{TUNE_MODEL}': "
       f"train={X_tr.shape[0]}, val={X_val.shape[0]}, test(held out)={X_test.shape[0]}")
 
 
+def _to_tensor(a, dtype):
+    return torch.as_tensor(np.ascontiguousarray(a), dtype=dtype, device=device)
+
+
+# Preload the ENTIRE dataset onto the GPU once. The matrix is small enough
+# (~a few GB) to stay resident, which removes the per-batch host->device copy
+# and DataLoader overhead that otherwise leaves the GPU idle (~0% utilisation).
+Xtr_g, ytr_t_g, ytr_s_g = _to_tensor(X_tr, torch.float32), _to_tensor(y_t_tr, torch.long), _to_tensor(y_s_tr, torch.long)
+Xval_g, yval_t_g, yval_s_g = _to_tensor(X_val, torch.float32), _to_tensor(y_t_val, torch.long), _to_tensor(y_s_val, torch.long)
+# Full train (train+val) and test, reused by the final eval and the fixed-HP benchmark.
+Xtrain_g, ytrain_t_g, ytrain_s_g = _to_tensor(X_train, torch.float32), _to_tensor(y_t_train, torch.long), _to_tensor(y_s_train, torch.long)
+Xtest_g, ytest_t_g, ytest_s_g = _to_tensor(X_test, torch.float32), _to_tensor(y_t_test, torch.long), _to_tensor(y_s_test, torch.long)
+if device.type == "cuda":
+    _gb = sum(t.element_size() * t.nelement() for t in (Xtr_g, Xval_g, Xtrain_g, Xtest_g)) / 1e9
+    print(f"📦 Dataset resident on GPU: {_gb:.2f} GB on {torch.cuda.get_device_name(0)} "
+          f"({torch.cuda.get_device_properties(0).total_memory / 1e9:.0f} GB total)")
+else:
+    print("⚠️  CUDA is NOT active — tensors are on CPU and training will be slow. "
+          "In Colab: Runtime > Change runtime type > GPU, and use a CUDA torch build.")
+
+
 def build_tuned_model(trial):
     """Instantiate TUNE_MODEL with structural hyperparameters proposed by the trial.
 
@@ -512,63 +533,66 @@ def build_tuned_model(trial):
     raise ValueError(f"Unknown TUNE_MODEL: {TUNE_MODEL}")
 
 
-def train_one_epoch(model, loader, optimizer, criterion, mask_ratio=0.0):
-    """One multi-task optimisation pass. mask_ratio randomly zeros a fraction of
-    gene inputs each batch (a masked-expression regulariser echoing scFM pretraining)."""
+def train_one_epoch(model, X, yt, ys, optimizer, criterion, batch_size, mask_ratio=0.0):
+    """One multi-task pass over GPU-resident tensors, sliced by a shuffled index.
+    mask_ratio randomly zeros a fraction of gene inputs each batch (a masked-expression
+    regulariser echoing scFM pretraining). No DataLoader / host->device copy."""
     model.train()
-    for expr, t, s in loader:
-        expr, t, s = expr.to(device), t.to(device), s.to(device)
+    n = X.shape[0]
+    perm = torch.randperm(n, device=X.device)
+    for i in range(0, n, batch_size):
+        idx = perm[i:i + batch_size]
+        xb = X[idx]
         if mask_ratio > 0.0:
-            keep = (torch.rand_like(expr) >= mask_ratio).float()
-            expr = expr * keep
-        optimizer.zero_grad()
-        pt, ps = model(expr)
-        loss = criterion(pt, t) + criterion(ps, s)
+            xb = xb * (torch.rand_like(xb) >= mask_ratio)
+        optimizer.zero_grad(set_to_none=True)
+        pt, ps = model(xb)
+        loss = criterion(pt, yt[idx]) + criterion(ps, ys[idx])
         loss.backward()
         optimizer.step()
 
 
 @torch.no_grad()
-def validate(model, loader, criterion):
-    """Return (mean multi-task val loss, macro-F1 cell type, macro-F1 tumor response)."""
+def validate(model, X, yt, ys, criterion, eval_batch=16384):
+    """Return (mean multi-task val loss, macro-F1 cell type, macro-F1 tumor response)
+    over GPU-resident tensors, evaluated in large chunks."""
     model.eval()
-    total_loss, n = 0.0, 0
-    yt_true, yt_pred, ys_true, ys_pred = [], [], [], []
-    for expr, t, s in loader:
-        expr, t, s = expr.to(device), t.to(device), s.to(device)
-        pt, ps = model(expr)
-        total_loss += (criterion(pt, t) + criterion(ps, s)).item() * expr.size(0)
-        n += expr.size(0)
-        yt_true.extend(t.cpu().numpy());  yt_pred.extend(torch.argmax(pt, 1).cpu().numpy())
-        ys_true.extend(s.cpu().numpy());  ys_pred.extend(torch.argmax(ps, 1).cpu().numpy())
+    n = X.shape[0]
+    total_loss = 0.0
+    yt_pred_chunks, ys_pred_chunks = [], []
+    for i in range(0, n, eval_batch):
+        xb = X[i:i + eval_batch]
+        pt, ps = model(xb)
+        total_loss += (criterion(pt, yt[i:i + eval_batch]) + criterion(ps, ys[i:i + eval_batch])).item() * xb.size(0)
+        yt_pred_chunks.append(torch.argmax(pt, 1))
+        ys_pred_chunks.append(torch.argmax(ps, 1))
     val_loss = total_loss / max(n, 1)
-    f1_t = f1_score(yt_true, yt_pred, average="macro", zero_division=0)
-    f1_s = f1_score(ys_true, ys_pred, average="macro", zero_division=0)
+    yt_pred = torch.cat(yt_pred_chunks).cpu().numpy()
+    ys_pred = torch.cat(ys_pred_chunks).cpu().numpy()
+    f1_t = f1_score(yt.cpu().numpy(), yt_pred, average="macro", zero_division=0)
+    f1_s = f1_score(ys.cpu().numpy(), ys_pred, average="macro", zero_division=0)
     return val_loss, f1_t, f1_s
 
 
 def objective(trial):
-    # 1. Suggest hyperparameters
+    # 1. Suggest hyperparameters. Batch sizes are GPU-friendly: large minibatches keep
+    #    these small MLPs compute-bound instead of Python/transfer-overhead-bound.
     lr = trial.suggest_float("lr", 1e-5, 1e-3, log=True)
     weight_decay = trial.suggest_float("weight_decay", 1e-4, 1e-1, log=True)
     mask_ratio = trial.suggest_float("mask_ratio", 0.0, 0.45)
-    batch_size = trial.suggest_categorical("batch_size", [16, 32, 64])
+    batch_size = trial.suggest_categorical("batch_size", [512, 1024, 2048, 4096])
 
-    # 2. Build model + data loaders for this trial
+    # 2. Build model for this trial (data already resident on the GPU)
     model = build_tuned_model(trial).to(device)
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     criterion = nn.CrossEntropyLoss()
-    train_loader = DataLoader(SCDataProcessor(X_tr, y_t_tr, y_s_tr),
-                              batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(SCDataProcessor(X_val, y_t_val, y_s_val),
-                            batch_size=512, shuffle=False)
 
     # 3. Training loop with pruning
     best_val = float("inf")
     try:
         for epoch in range(MAX_EPOCHS):
-            train_one_epoch(model, train_loader, optimizer, criterion, mask_ratio)
-            val_loss, f1_t, f1_s = validate(model, val_loader, criterion)
+            train_one_epoch(model, Xtr_g, ytr_t_g, ytr_s_g, optimizer, criterion, batch_size, mask_ratio)
+            val_loss, f1_t, f1_s = validate(model, Xval_g, yval_t_g, yval_s_g, criterion)
             best_val = min(best_val, val_loss)
 
             # Log auxiliary metrics so the best trial is inspectable later
@@ -622,13 +646,9 @@ def evaluate_best_on_test():
     model = build_tuned_model(optuna.trial.FixedTrial(bp)).to(device)
     optimizer = optim.AdamW(model.parameters(), lr=bp["lr"], weight_decay=bp["weight_decay"])
     criterion = nn.CrossEntropyLoss()
-    full_train_loader = DataLoader(SCDataProcessor(X_train, y_t_train, y_s_train),
-                                   batch_size=bp["batch_size"], shuffle=True)
-    test_eval_loader = DataLoader(SCDataProcessor(X_test, y_t_test, y_s_test),
-                                  batch_size=512, shuffle=False)
     for _ in range(MAX_EPOCHS):
-        train_one_epoch(model, full_train_loader, optimizer, criterion, bp["mask_ratio"])
-    test_loss, f1_t, f1_s = validate(model, test_eval_loader, criterion)
+        train_one_epoch(model, Xtrain_g, ytrain_t_g, ytrain_s_g, optimizer, criterion, bp["batch_size"], bp["mask_ratio"])
+    test_loss, f1_t, f1_s = validate(model, Xtest_g, ytest_t_g, ytest_s_g, criterion)
     print(f"\n✅ Retrained best '{TUNE_MODEL}' on full train set — HELD-OUT TEST metrics:")
     print(f"   - Test loss           : {test_loss:.4f}")
     print(f"   - Macro-F1 Cell Type  : {f1_t:.3f}")
@@ -780,13 +800,16 @@ def train_and_profile_with_energy(model_class, name):
     power_cm = monitor if (monitor is not None and monitor.available) else nullcontext()
 
     model.train()
+    bench_bs = 2048                      # GPU-friendly batch for the fixed-HP benchmark
+    n_tr = Xtrain_g.shape[0]
     with power_cm:
         for epoch in range(args.benchmark_epochs):
-            for expr, t, s in train_loader:
-                expr, t, s = expr.to(device), t.to(device), s.to(device)
-                optimizer.zero_grad()
-                pt, ps = model(expr)
-                loss = criterion(pt, t) + criterion(ps, s)
+            perm = torch.randperm(n_tr, device=device)
+            for i in range(0, n_tr, bench_bs):
+                idx = perm[i:i + bench_bs]
+                optimizer.zero_grad(set_to_none=True)
+                pt, ps = model(Xtrain_g[idx])
+                loss = criterion(pt, ytrain_t_g[idx]) + criterion(ps, ytrain_s_g[idx])
                 loss.backward()
                 optimizer.step()
             if monitor is not None:
@@ -811,14 +834,23 @@ def train_and_profile_with_energy(model_class, name):
         })
 
     # --- INFERENCE, LATENCY AND GREEN AI PHASE ---
+    # Time a full forward pass over the GPU-resident test set, in large chunks.
+    # cuda.synchronize() brackets ensure the timer captures actual GPU work,
+    # not just async kernel-launch time.
     model.eval()
+    n_te = Xtest_g.shape[0]
+    eval_bs = 16384
+    all_pt, all_ps = [], []
+    if device.type == "cuda":
+        torch.cuda.synchronize()
     start_time = time.time()
-
     with torch.no_grad():
-        for expr, _, _ in test_loader:
-            expr = expr.to(device)
-            _ = model(expr)
-
+        for i in range(0, n_te, eval_bs):
+            pt, ps = model(Xtest_g[i:i + eval_bs])
+            all_pt.append(torch.argmax(pt, 1))
+            all_ps.append(torch.argmax(ps, 1))
+    if device.type == "cuda":
+        torch.cuda.synchronize()
     end_time = time.time()
     inference_latency = (end_time - start_time) * 1000
 
@@ -826,15 +858,8 @@ def train_and_profile_with_energy(model_class, name):
     gpu_power_watts = args.gpu_power_watts   # GPU TDP from --gpu-power-watts (T4=70, V100=300, A100=400)
     energy_joules = gpu_power_watts * execution_time_seconds
 
-    all_pt, all_ps = [], []
-    with torch.no_grad():
-        for expr, _, _ in test_loader:
-            pt, ps = model(expr.to(device))
-            all_pt.extend(torch.argmax(pt, dim=1).cpu().numpy())
-            all_ps.extend(torch.argmax(ps, dim=1).cpu().numpy())
-
-    f1_t = f1_score(y_t_test, all_pt, average='macro')
-    f1_s = f1_score(y_s_test, all_ps, average='macro')
+    f1_t = f1_score(y_t_test, torch.cat(all_pt).cpu().numpy(), average='macro')
+    f1_s = f1_score(y_s_test, torch.cat(all_ps).cpu().numpy(), average='macro')
 
     return {
         "Model": name,
