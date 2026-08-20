@@ -1,0 +1,37 @@
+# --- LaTeX build artifacts ---
+*.aux
+*.bbl
+*.blg
+*.fdb_latexmk
+*.fls
+*.log
+*.out
+*.spl
+*.synctex.gz
+*.toc
+*.lof
+*.lot
+
+# --- Data (downloaded at runtime; too large for git) ---
+GSE197268_data/
+*.tar
+*.tar.gz
+*.mtx
+*.mtx.gz
+
+# --- Optuna study / model artifacts ---
+*.db
+*.pt
+*.pth
+*.ckpt
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.venv/
+venv/
+
+# --- OS / editor ---
+.DS_Store
+.claude/
