@@ -79,6 +79,9 @@ def parse_args():
     t.add_argument("--seed", type=int, default=42, help="Global random seed.")
     t.add_argument("--test-size", type=float, default=0.2, help="Held-out test fraction.")
     t.add_argument("--val-size", type=float, default=0.2, help="Validation fraction carved from train for HPO.")
+    t.add_argument("--split-by", choices=["patient", "cell"], default="patient",
+                   help="'patient' keeps each patient entirely in one split (no leakage; correct for the "
+                        "patient-level resistance label). 'cell' is the old leaky per-cell split.")
     t.add_argument("--batch-size", type=int, default=64, help="Batch size for the fixed-HP benchmark.")
     t.add_argument("--benchmark-epochs", type=int, default=10, help="Epochs for the fixed-HP benchmark models.")
 
@@ -431,13 +434,43 @@ class SCDataProcessor(Dataset):
     def __len__(self): return len(self.expressions)
     def __getitem__(self, idx): return self.expressions[idx], self.cell_types[idx], self.tumor_statuses[idx]
 
-# Split estratificado para mitigar el desbalance celular
-X_train, X_test, y_t_train, y_t_test, y_s_train, y_s_test = train_test_split(
-    X_data, labels_type, labels_status, test_size=args.test_size, random_state=args.seed, stratify=labels_type
-)
+def patient_group_split(groups, test_size, seed, strat_labels=None):
+    """Return (train_idx, test_idx) whose PATIENT groups are disjoint (no patient in
+    both). When strat_labels is given (constant within a patient, e.g. the patient-level
+    response), the patient split is stratified by that per-patient label."""
+    groups = np.asarray(groups)
+    uniq = np.array(sorted(set(groups.tolist()), key=lambda g: int(g) if str(g).isdigit() else g))
+    strat = None
+    if strat_labels is not None:
+        strat_labels = np.asarray(strat_labels)
+        strat = np.array([strat_labels[groups == g][0] for g in uniq])
+    try:
+        _, test_g = train_test_split(uniq, test_size=test_size, random_state=seed, stratify=strat)
+    except ValueError:  # too few patients per class to stratify
+        _, test_g = train_test_split(uniq, test_size=test_size, random_state=seed)
+    in_test = np.isin(groups, test_g)
+    return np.where(~in_test)[0], np.where(in_test)[0]
 
-train_loader = DataLoader(SCDataProcessor(X_train, y_t_train, y_s_train), batch_size=args.batch_size, shuffle=True)
-test_loader = DataLoader(SCDataProcessor(X_test, y_t_test, y_s_test), batch_size=args.batch_size, shuffle=False)
+
+# Patient identity per cell (aligned with X_data rows) for group-aware splitting.
+patient_ids = adata.obs['patient_num'].astype(str).to_numpy()
+
+if args.split_by == "patient":
+    # Split by PATIENT so test patients are entirely unseen. This is the correct
+    # protocol for the patient-level resistance label and avoids identity leakage.
+    _tr, _te = patient_group_split(patient_ids, args.test_size, args.seed, strat_labels=labels_status)
+    X_train, X_test = X_data[_tr], X_data[_te]
+    y_t_train, y_t_test = labels_type[_tr], labels_type[_te]
+    y_s_train, y_s_test = labels_status[_tr], labels_status[_te]
+    groups_train = patient_ids[_tr]
+    print(f"🧬 Patient-level split: {len(set(groups_train.tolist()))} train / "
+          f"{len(set(patient_ids[_te].tolist()))} test patients (disjoint).")
+else:
+    X_train, X_test, y_t_train, y_t_test, y_s_train, y_s_test = train_test_split(
+        X_data, labels_type, labels_status, test_size=args.test_size, random_state=args.seed, stratify=labels_type)
+    groups_train = None
+    print("⚠️  Cell-level split (--split-by cell): patients overlap train/test; "
+          "resistance metrics are optimistically biased by patient-identity leakage.")
 
 # ==========================================
 # MODELO BASE: NUESTRO MULTI-TASK ANTERIOR
@@ -523,11 +556,18 @@ MAX_EPOCHS = args.search_epochs
 # ---- Carve a VALIDATION set out of the TRAINING data only. ----
 # The held-out test set (X_test) is never seen during the search; it is used
 # once at the end to report the unbiased performance of the winning config.
-X_tr, X_val, y_t_tr, y_t_val, y_s_tr, y_s_val = train_test_split(
-    X_train, y_t_train, y_s_train,
-    test_size=args.val_size, random_state=args.seed, stratify=y_t_train,
-)
-print(f"🔎 Optuna search on '{TUNE_MODEL}': "
+if args.split_by == "patient" and groups_train is not None:
+    # Validation patients are also disjoint from training patients.
+    _vtr, _vval = patient_group_split(groups_train, args.val_size, args.seed, strat_labels=y_s_train)
+    X_tr, X_val = X_train[_vtr], X_train[_vval]
+    y_t_tr, y_t_val = y_t_train[_vtr], y_t_train[_vval]
+    y_s_tr, y_s_val = y_s_train[_vtr], y_s_train[_vval]
+else:
+    X_tr, X_val, y_t_tr, y_t_val, y_s_tr, y_s_val = train_test_split(
+        X_train, y_t_train, y_s_train,
+        test_size=args.val_size, random_state=args.seed, stratify=y_t_train,
+    )
+print(f"🔎 Optuna search on '{TUNE_MODEL}' [{args.split_by}-level split]: "
       f"train={X_tr.shape[0]}, val={X_val.shape[0]}, test(held out)={X_test.shape[0]}")
 
 
@@ -774,7 +814,8 @@ class GPUPowerMonitor:
     def energy_joules(self):
         """Integrate power over time (trapezoidal) for a MEASURED energy figure."""
         if len(self.times) >= 2:
-            return float(np.trapz(self.watts, self.times))
+            _trapz = getattr(np, "trapezoid", np.trapz)  # numpy>=2 renamed trapz -> trapezoid
+            return float(_trapz(self.watts, self.times))
         return None
 
 
