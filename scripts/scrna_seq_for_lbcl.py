@@ -373,10 +373,11 @@ present_patients = sorted({int(p) for p in patient_num.dropna().unique()})
 
 
 def _norm_response(r):
+    # responder / partial response -> tumor Sensitive; non-responder -> Resistant.
     r = str(r).strip().lower()
     if r in ('responder', 'r', 'sensitive', 'cr', 'pr', 'response'):
         return 'Sensitive'
-    if r in ('non-responder', 'nonresponder', 'non responder', 'n', 'resistant', 'pd', 'sd'):
+    if r in ('non-responder', 'nonresponder', 'non responder', 'n', 'nr', 'resistant', 'pd', 'sd'):
         return 'Resistant'
     return None
 
