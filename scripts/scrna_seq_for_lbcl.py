@@ -63,10 +63,17 @@ def parse_args():
     q.add_argument("--scale-max", type=float, default=10.0, help="Clip value after z-scaling.")
 
     lb = p.add_argument_group("label inference")
+    lb.add_argument("--response-csv", default=None,
+                    help="CSV of real per-patient clinical response (columns: patient,response; "
+                         "response in {responder,non-responder}). Required for valid resistance results; "
+                         "fill from Haradhvala et al. 2022 Supp. Table 1 (patient N == GEO 'PatientN').")
+    lb.add_argument("--marker-threshold", type=float, default=0.5,
+                    help="Scaled-expression threshold for B/T lineage marker positivity.")
+    lb.add_argument("--random-response", action="store_true",
+                    help="PIPELINE TEST ONLY: assign random Sensitive/Resistant labels. "
+                         "Resistance results are NOT scientifically valid under this flag.")
     lb.add_argument("--sensitive-prob", type=float, default=0.58,
-                    help="Prior probability of 'Sensitive' when donor metadata is absent (Resistant = 1 - this).")
-    lb.add_argument("--cart-frac", type=float, default=0.3,
-                    help="Fraction of T cells relabeled CAR_T under the expression heuristic.")
+                    help="Prior prob of 'Sensitive' used ONLY with --random-response.")
 
     t = p.add_argument_group("training / split")
     t.add_argument("--seed", type=int, default=42, help="Global random seed.")
@@ -325,44 +332,81 @@ sc.pp.highly_variable_genes(adata, min_mean=args.hvg_min_mean, max_mean=args.hvg
 adata = adata[:, adata.var['highly_variable']].copy()
 sc.pp.scale(adata, max_value=args.scale_max)
 
-# --- 4. SOTA MAPPING OF REAL CLINICAL COHORT METADATA ---
-# The GSE197268 study classifies cells by immune lineages and therapy responses (Axi-Cel/CD19)
-# We map 'cell_type' (B, T, or CAR-T inferred by markers) and 'tumor_status' using real donor metadata.
-# To ensure your notebook runs without errors if you download filtered versions from GEO, we use a secure mapper:
+# --- 4. REAL CLINICAL COHORT LABELS ---
+# Labels are grounded in the GSE197268 experimental design and the Haradhvala et al.
+# (2022) clinical outcomes, NOT random assignment:
+#   (a) CAR-T identity  -> cells from the FACS CAR-pos sorted samples (GEO 'sorting: CAR-pos',
+#                          encoded in the sample title as '...-CART'). A real experimental label.
+#   (b) B vs T lineage  -> canonical surface/lineage markers (for non-CAR-sorted cells).
+#   (c) Clinical resp.  -> per-patient responder/non-responder from --response-csv. GEO does NOT
+#                          encode response; it comes from Haradhvala et al. 2022 Supp. Table 1
+#                          (responder = no relapse by 6 months; 15/32 patients were non-responders).
+print("🏷️  Assigning real cohort labels (CAR-pos sorting, lineage markers, per-patient response)...")
 
-# In a series matrix file, metadata is usually in the comments.
-# For simplicity, we will continue with the inference logic that was already in place,
-# as direct metadata columns like 'cell_type_author' are typically not part of the
-# expression matrix itself.
-print("⚠️ Mapping cell annotations from the original study's clinical signatures (inferred from expression)...")
+sample_names = adata.obs['patient_id'].astype(str)
 
-# Initialize cell_type_mapped with a default value
-adata.obs['cell_type_mapped'] = 'Undefined'
+# (a) CAR-T from CAR-pos sorted samples
+is_cart_sample = sample_names.str.contains('CART', case=False, regex=False).to_numpy()
 
-# Infer T_Cell based on CD3D expression
-if 'CD3D' in adata.var_names:
-    adata.obs.loc[adata[:, 'CD3D'].X.toarray().flatten() > 0.5, 'cell_type_mapped'] = 'T_Cell'
+
+def _marker_positive(genes, thr):
+    present = [g for g in genes if g in adata.var_names]
+    if not present:
+        print(f"   Warning: none of {genes} present in HVG set; lineage call may be less accurate.")
+        return np.zeros(adata.n_obs, dtype=bool)
+    M = adata[:, present].X
+    M = M.toarray() if hasattr(M, "toarray") else np.asarray(M)
+    return (M > thr).any(axis=1)
+
+
+# (b) B vs T lineage from canonical markers
+t_pos = _marker_positive(['CD3D', 'CD3E', 'CD3G'], args.marker_threshold)
+b_pos = _marker_positive(['MS4A1', 'CD79A', 'CD79B', 'CD19'], args.marker_threshold)
+adata.obs['cell_type_mapped'] = 'B_Cell'
+adata.obs.loc[t_pos & ~b_pos, 'cell_type_mapped'] = 'T_Cell'
+adata.obs.loc[is_cart_sample, 'cell_type_mapped'] = 'CAR_T'   # sorted CAR+ overrides marker call
+
+# (c) Patient-level clinical response
+patient_num = sample_names.str.extract(r'[Pp]atient(\d+)', expand=False)
+adata.obs['patient_num'] = patient_num
+present_patients = sorted({int(p) for p in patient_num.dropna().unique()})
+
+
+def _norm_response(r):
+    r = str(r).strip().lower()
+    if r in ('responder', 'r', 'sensitive', 'cr', 'pr', 'response'):
+        return 'Sensitive'
+    if r in ('non-responder', 'nonresponder', 'non responder', 'n', 'resistant', 'pd', 'sd'):
+        return 'Resistant'
+    return None
+
+
+if args.response_csv:
+    resp_df = pd.read_csv(args.response_csv)
+    resp_df.columns = [c.strip().lower() for c in resp_df.columns]
+    resp_map = {int(row['patient']): _norm_response(row['response']) for _, row in resp_df.iterrows()}
+    missing = [p for p in present_patients if resp_map.get(p) is None]
+    if missing:
+        raise ValueError(f"--response-csv lacks valid responder/non-responder labels for patients {missing}. "
+                         "Fill them from Haradhvala et al. 2022 Supp. Table 1.")
+    adata.obs['tumor_status_mapped'] = [resp_map[int(p)] if pd.notna(p) else 'Sensitive' for p in patient_num]
+    print(f"   ✅ Clinical response mapped from real per-patient labels for {len(present_patients)} patients.")
+elif args.random_response:
+    print("   ⚠️  --random-response: RANDOM Sensitive/Resistant labels (PIPELINE TEST ONLY; "
+          "resistance results are NOT scientifically valid).")
+    adata.obs['tumor_status_mapped'] = np.random.choice(
+        ['Sensitive', 'Resistant'], size=adata.n_obs, p=[args.sensitive_prob, 1.0 - args.sensitive_prob])
 else:
-    print("Warning: 'CD3D' not found in gene names. T_Cell inference might be less accurate.")
-
-# Infer B_Cell if not T_Cell (simple heuristic)
-adata.obs.loc[adata.obs['cell_type_mapped'] == 'Undefined', 'cell_type_mapped'] = 'B_Cell'
-
-
-# Identify real CAR+ cells by detecting the synthetic vector or CAR construct markers
-if 'CAR-sequence' in adata.var_names:
-    adata.obs.loc[adata[:, 'CAR-sequence'].X.toarray().flatten() > 0, 'cell_type_mapped'] = 'CAR_T'
-else:
-    print("Warning: 'CAR-sequence' not found in gene names. CAR_T cell inference will use a heuristic.")
-    # Overexpressed clonal T cells post-infusion act as the study's biological proxy
-    # This is a heuristic and might need to be adjusted based on real data characteristics
-    adata.obs.loc[(adata.obs['cell_type_mapped'] == 'T_Cell') & (np.random.rand(adata.n_obs) < args.cart_frac), 'cell_type_mapped'] = 'CAR_T'
-
-
-# Keep the random choice for tumor status if no explicit metadata is available
-adata.obs['tumor_status_mapped'] = np.random.choice(
-    ['Sensitive', 'Resistant'], size=adata.n_obs,
-    p=[args.sensitive_prob, 1.0 - args.sensitive_prob])
+    template = os.path.join(args.output_dir, "patient_response_template.csv")
+    pd.DataFrame({'patient': present_patients, 'response': ['' for _ in present_patients]}).to_csv(template, index=False)
+    raise SystemExit(
+        f"\n❌ No clinical-response labels provided, and GSE197268 does not encode response in GEO.\n"
+        f"   A blank template with all {len(present_patients)} patients was written to:\n"
+        f"       {template}\n"
+        f"   Fill the 'response' column (responder / non-responder) from Haradhvala et al. 2022\n"
+        f"   (Nature Medicine; Supplementary Table 1; GEO 'PatientN' == that study's patient N),\n"
+        f"   then re-run with:  --response-csv {template}\n"
+        f"   (For a pipeline-only smoke test with meaningless labels, pass --random-response.)")
 
 # Final encoding for PyTorch
 le_type, le_status = LabelEncoder(), LabelEncoder()

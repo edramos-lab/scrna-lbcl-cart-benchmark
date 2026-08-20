@@ -32,12 +32,24 @@ python scripts/scrna_seq_for_lbcl.py \
   --power-monitor \
   --tune-model "scGPT (Generative)" \
   --n-trials 30 --search-epochs 20 \
+  --response-csv patient_response.csv \
   --output-dir ./outputs
 ```
 
 Key flags: `--gpu-power-watts` (T4=70, V100=300, A100=400), `--tune-model`, `--n-trials`,
-`--skip-download` (reuse data on re-runs), `--power-monitor`, `--skip-gpu-tsne`.
-Run `python scripts/scrna_seq_for_lbcl.py --help` for the full list.
+`--skip-download` (reuse data on re-runs), `--power-monitor`, `--skip-gpu-tsne`,
+`--response-csv`. Run `python scripts/scrna_seq_for_lbcl.py --help` for the full list.
+
+### Labels (important)
+
+Cell labels are grounded in the real cohort, not random:
+- **CAR-T** = cells from the FACS `CAR-pos` sorted samples (`sorting: CAR-pos` in GEO, `...-CART` titles).
+- **B vs T** = canonical lineage markers (CD3D/E/G; MS4A1/CD79A/B/CD19).
+- **Clinical response** = per-patient responder/non-responder. GEO does **not** encode response, so you
+  must supply it via `--response-csv` (columns `patient,response`), filled from Haradhvala et al. 2022
+  Supplementary Table 1 (responder = no relapse by 6 months). Run once without the flag to get a blank
+  `patient_response_template.csv` listing every patient. `--random-response` exists for pipeline smoke
+  tests only and produces scientifically invalid resistance results.
 
 ## Data
 
