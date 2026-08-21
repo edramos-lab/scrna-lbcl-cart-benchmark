@@ -134,10 +134,25 @@ torch.manual_seed(args.seed)
 np.random.seed(args.seed)
 os.makedirs(args.output_dir, exist_ok=True)
 
+# Flat key -> value log of run-level results, written to run_summary.csv at the end
+# and included in the auto-zipped output (covers everything from the HPO search
+# through the final chi-squared test, plus the run configuration for context).
+run_summary = {}
+
 print(f"✅ Bibliotecas instaladas. NumPy versión: {np.__version__}")
 print(f"🌍 Entorno listo en: {device}. SI VES UN ERROR DE IMPORTACIÓN, REINICIA LA SESIÓN (Runtime > Restart session).")
 print(f"⚙️  Config: tune-model='{args.tune_model}', n-trials={args.n_trials}, "
       f"gpu-power={args.gpu_power_watts} W, seed={args.seed}")
+run_summary.update({
+    "numpy_version": np.__version__,
+    "device": str(device),
+    "tune_model": args.tune_model,
+    "n_trials": args.n_trials,
+    "gpu_power_watts": args.gpu_power_watts,
+    "seed": args.seed,
+    "split_by": args.split_by,
+    "cv_folds": args.cv_folds,
+})
 
 # Headless-safe table renderer: rich display in notebooks, plain text as a script.
 try:
@@ -423,10 +438,18 @@ labels_status = le_status.fit_transform(adata.obs['tumor_status_mapped'])
 X_data = adata.X.toarray() if hasattr(adata.X, "toarray") else adata.X
 input_dim = X_data.shape[1]
 
+_lineage_counts = dict(pd.Series(adata.obs['cell_type_mapped']).value_counts())
+_status_counts = dict(pd.Series(adata.obs['tumor_status_mapped']).value_counts())
 print(f"\n✅ REAL CLINICAL VALIDATION SUCCESS!")
 print(f"   - Matrix Dimensions (Real Cells, HVG Genes): {X_data.shape}")
-print(f"   - Real Lineage Distribution: {dict(pd.Series(adata.obs['cell_type_mapped']).value_counts())}")
-print(f"   - Clinical Status Distribution: {dict(pd.Series(adata.obs['tumor_status_mapped']).value_counts())}")
+print(f"   - Real Lineage Distribution: {_lineage_counts}")
+print(f"   - Clinical Status Distribution: {_status_counts}")
+run_summary["n_cells"] = X_data.shape[0]
+run_summary["n_hvg_genes"] = X_data.shape[1]
+for _k, _v in _lineage_counts.items():
+    run_summary[f"lineage_{_k}"] = int(_v)
+for _k, _v in _status_counts.items():
+    run_summary[f"clinical_status_{_k}"] = int(_v)
 
 class SCDataProcessor(Dataset):
     def __init__(self, expressions, cell_types, tumor_statuses):
@@ -466,8 +489,10 @@ if args.split_by == "patient":
     y_t_train, y_t_test = labels_type[_tr], labels_type[_te]
     y_s_train, y_s_test = labels_status[_tr], labels_status[_te]
     groups_train = patient_ids[_tr]
-    print(f"🧬 Patient-level split: {len(set(groups_train.tolist()))} train / "
-          f"{len(set(patient_ids[_te].tolist()))} test patients (disjoint).")
+    _n_train_pat, _n_test_pat = len(set(groups_train.tolist())), len(set(patient_ids[_te].tolist()))
+    print(f"🧬 Patient-level split: {_n_train_pat} train / {_n_test_pat} test patients (disjoint).")
+    run_summary["train_patients"] = _n_train_pat
+    run_summary["test_patients"] = _n_test_pat
 else:
     X_train, X_test, y_t_train, y_t_test, y_s_train, y_s_test = train_test_split(
         X_data, labels_type, labels_status, test_size=args.test_size, random_state=args.seed, stratify=labels_type)
@@ -728,6 +753,13 @@ else:
         print(f"     - {k}: {v}")
     print(f"   Best-trial macro-F1  -> cell type: {study.best_trial.user_attrs.get('f1_cell_type')}, "
           f"tumor response: {study.best_trial.user_attrs.get('f1_tumor_response')}")
+    run_summary["hpo_completed_trials"] = len(study.trials)
+    run_summary["hpo_best_trial_number"] = study.best_trial.number
+    run_summary["hpo_best_val_loss"] = round(study.best_value, 6)
+    for k, v in study.best_params.items():
+        run_summary[f"hpo_best_{k}"] = v
+    run_summary["hpo_best_trial_f1_cell_type"] = study.best_trial.user_attrs.get('f1_cell_type')
+    run_summary["hpo_best_trial_f1_tumor_response"] = study.best_trial.user_attrs.get('f1_tumor_response')
 
 
 def evaluate_best_on_test():
@@ -745,6 +777,9 @@ def evaluate_best_on_test():
     print(f"   - Test loss           : {test_loss:.4f}")
     print(f"   - Macro-F1 Cell Type  : {f1_t:.3f}")
     print(f"   - Macro-F1 Tumor Resp.: {f1_s:.3f}")
+    run_summary["retrained_test_loss"] = round(test_loss, 6)
+    run_summary["retrained_test_f1_cell_type"] = round(float(f1_t), 3)
+    run_summary["retrained_test_f1_tumor_response"] = round(float(f1_s), 3)
     return model
 
 # Only retrain-on-best when a search actually produced completed trials.
@@ -1258,6 +1293,9 @@ adata.obs['is_outlier'] = np.where(outlier_preds == -1, 'Anomalous / Outliers', 
 num_outliers = np.sum(outlier_preds == -1)
 
 print(f"✅ Analysis concluded. {num_outliers} anomalous cells detected out of a total of {X_data.shape[0]}.")
+run_summary["isolation_forest_contamination"] = args.contamination
+run_summary["anomalous_cells"] = int(num_outliers)
+run_summary["total_cells_for_anomaly_scan"] = int(X_data.shape[0])
 
 # ---- SCIENTIFIC VISUALIZATION OF ANOMALOUS CELLS ----
 fig_out, ax_out = plt.subplots(figsize=(8, 6), dpi=300)
@@ -1344,16 +1382,27 @@ else:
     contingency_table = pd.crosstab(df_cross['Is_Outlier'], df_cross['Tumor_Status'])
     print("\n📊 CONTINGENCY TABLE (Cell Distribution):")
     show_table(contingency_table)
+    contingency_table.to_csv(os.path.join(args.output_dir, "outlier_tumor_contingency.csv"))
 
     # Chi-cuadrado: ¿la atipicidad está ligada a la resistencia?
     chi2, p_val, dof, expected = stats.chi2_contingency(contingency_table)
+    n_obs = contingency_table.to_numpy().sum()
+    cramers_v = float(np.sqrt(chi2 / n_obs))  # effect size: large N makes p-value alone misleading
     print(f"\n🧪 Statistical Independence Evaluation (Chi-Squared):")
     print(f"   - Chi2 Value: {chi2:.4f}")
     print(f"   - P-Value: {p_val:.4e}")
+    print(f"   - Cramér's V (effect size): {cramers_v:.4f}")
     if p_val < 0.05:
         print("   - 🎉 Statistical Significance Detected! Transcriptomic outliers do not occur randomly; they are biologically linked to tumor status.")
+        if cramers_v < 0.1:
+            print("   - ⚠️  However, Cramér's V indicates a negligible effect size — with this many cells, "
+                  "statistical significance alone does not imply a practically useful association.")
     else:
         print("   - Outliers and tumor resistance are statistically independent in this dataset.")
+    run_summary["outlier_resistance_chi2"] = round(float(chi2), 4)
+    run_summary["outlier_resistance_p_value"] = p_val
+    run_summary["outlier_resistance_cramers_v"] = round(cramers_v, 4)
+    run_summary["outlier_resistance_dof"] = int(dof)
 
     # 4. Expresión diferencial del gen líder entre células normales y atípicas
     target_gene = top_genes_xai[0]
@@ -1380,6 +1429,12 @@ else:
             pass
 
 print("\n🎉 Pipeline finished. All figures written to:", os.path.abspath(args.output_dir))
+
+# Write the full run summary (config -> dataset -> HPO -> retrained test metrics ->
+# anomaly scan -> chi-squared/effect size) as a long-format key,value CSV.
+_run_summary_csv = os.path.join(args.output_dir, "run_summary.csv")
+pd.DataFrame(list(run_summary.items()), columns=["Metric", "Value"]).to_csv(_run_summary_csv, index=False)
+print(f"💾 Run summary saved to {_run_summary_csv} (included in the final output zip).")
 
 # ============================================================
 #  FINAL STEP: zip the output folder (named after the folder itself) and download it
