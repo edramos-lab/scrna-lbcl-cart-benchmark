@@ -51,6 +51,18 @@ Cell labels are grounded in the real cohort, not random:
   `patient_response_template.csv` listing every patient. `--random-response` exists for pipeline smoke
   tests only and produces scientifically invalid resistance results.
 
+### Evaluation protocol (avoid leakage)
+
+Because clinical response is a **patient-level** label, all splitting is by patient (`--split-by patient`,
+default) so no patient appears in both train and test. A naive per-cell split (`--split-by cell`) leaks
+patient identity and inflates resistance F1 roughly two-fold. For a robust estimate over the small
+(32-patient) cohort, use **GroupKFold cross-validation**, which holds out whole patients per fold and
+reports mean±SD across folds:
+
+```bash
+python scripts/scrna_seq_for_lbcl.py --response-csv patient_response.csv --cv-folds 5 --skip-download
+```
+
 ## Data
 
 The GSE197268 raw data (~GBs) is **not** included; the script downloads it from NCBI GEO at runtime.

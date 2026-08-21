@@ -28,7 +28,7 @@ import time
 import matplotlib.pyplot as plt
 import plotly.express as px
 from sklearn.manifold import TSNE
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, GroupKFold
 from sklearn.preprocessing import LabelEncoder
 from sklearn.metrics import classification_report, f1_score, accuracy_score
 from captum.attr import IntegratedGradients
@@ -82,6 +82,9 @@ def parse_args():
     t.add_argument("--split-by", choices=["patient", "cell"], default="patient",
                    help="'patient' keeps each patient entirely in one split (no leakage; correct for the "
                         "patient-level resistance label). 'cell' is the old leaky per-cell split.")
+    t.add_argument("--cv-folds", type=int, default=1,
+                   help="If >1, evaluate the four benchmark models with GroupKFold cross-validation over "
+                        "patients (no patient spans folds) and report mean+/-std F1. 1 = single held-out split.")
     t.add_argument("--batch-size", type=int, default=64, help="Batch size for the fixed-HP benchmark.")
     t.add_argument("--benchmark-epochs", type=int, default=10, help="Epochs for the fixed-HP benchmark models.")
 
@@ -583,6 +586,10 @@ Xval_g, yval_t_g, yval_s_g = _to_tensor(X_val, torch.float32), _to_tensor(y_t_va
 # Full train (train+val) and test, reused by the final eval and the fixed-HP benchmark.
 Xtrain_g, ytrain_t_g, ytrain_s_g = _to_tensor(X_train, torch.float32), _to_tensor(y_t_train, torch.long), _to_tensor(y_s_train, torch.long)
 Xtest_g, ytest_t_g, ytest_s_g = _to_tensor(X_test, torch.float32), _to_tensor(y_t_test, torch.long), _to_tensor(y_s_test, torch.long)
+# For GroupKFold cross-validation the full cohort is kept resident and indexed per fold.
+if args.cv_folds > 1:
+    Xall_g = _to_tensor(X_data, torch.float32)
+    yall_t_g, yall_s_g = _to_tensor(labels_type, torch.long), _to_tensor(labels_status, torch.long)
 if device.type == "cuda":
     _gb = sum(t.element_size() * t.nelement() for t in (Xtr_g, Xval_g, Xtrain_g, Xtest_g)) / 1e9
     print(f"📦 Dataset resident on GPU: {_gb:.2f} GB on {torch.cuda.get_device_name(0)} "
@@ -958,7 +965,80 @@ def train_and_profile_with_energy(model_class, name):
         "F1 Tumor Response": round(f1_s, 3)
     }, model
 
-# --- FIX: Define models to evaluate ---
+def train_and_profile_cv(model_class, name, n_folds):
+    """Evaluate a model with GroupKFold over patients (no patient spans folds).
+
+    Trains a fresh model on each fold's training patients, scores on the held-out
+    fold, and returns mean+/-std of Macro-F1 across folds. Latency/energy are measured
+    once (fold 0) since they do not depend on the split. Reports a single trained model
+    (last fold) for downstream XAI, but the headline metrics are the cross-validated means.
+    """
+    print(f"\n⚙️ Processing (GroupKFold, {n_folds} folds): {name}...")
+    gkf = GroupKFold(n_splits=n_folds)
+    n_all = Xall_g.shape[0]
+    fold_f1_t, fold_f1_s = [], []
+    latency = energy = None
+    trained_m = None
+    bench_bs, eval_bs = 2048, 16384
+
+    for fold, (tr_idx, te_idx) in enumerate(gkf.split(np.arange(n_all), groups=patient_ids)):
+        tr_idx_g = torch.as_tensor(tr_idx, device=device)
+        te_idx_g = torch.as_tensor(te_idx, device=device)
+        model = model_class(input_dim).to(device)
+        optimizer = optim.AdamW(model.parameters(), lr=0.001)
+        criterion = nn.CrossEntropyLoss()
+
+        model.train()
+        for epoch in range(args.benchmark_epochs):
+            perm = tr_idx_g[torch.randperm(tr_idx_g.shape[0], device=device)]
+            for i in range(0, perm.shape[0], bench_bs):
+                idx = perm[i:i + bench_bs]
+                optimizer.zero_grad(set_to_none=True)
+                pt, ps = model(Xall_g[idx])
+                loss = criterion(pt, yall_t_g[idx]) + criterion(ps, yall_s_g[idx])
+                loss.backward()
+                optimizer.step()
+
+        model.eval()
+        preds_t, preds_s = [], []
+        if fold == 0 and device.type == "cuda":
+            torch.cuda.synchronize()
+        t0 = time.time()
+        with torch.no_grad():
+            for i in range(0, te_idx_g.shape[0], eval_bs):
+                idx = te_idx_g[i:i + eval_bs]
+                pt, ps = model(Xall_g[idx])
+                preds_t.append(torch.argmax(pt, 1))
+                preds_s.append(torch.argmax(ps, 1))
+        if fold == 0:
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            latency = round((time.time() - t0) * 1000, 2)
+            energy = round(args.gpu_power_watts * (time.time() - t0), 4)
+        yt_true = yall_t_g[te_idx_g].cpu().numpy()
+        ys_true = yall_s_g[te_idx_g].cpu().numpy()
+        f1t = f1_score(yt_true, torch.cat(preds_t).cpu().numpy(), average='macro', zero_division=0)
+        f1s = f1_score(ys_true, torch.cat(preds_s).cpu().numpy(), average='macro', zero_division=0)
+        fold_f1_t.append(f1t)
+        fold_f1_s.append(f1s)
+        trained_m = model
+        print(f"   fold {fold + 1}/{n_folds}: F1 cell-type={f1t:.3f}, F1 resistance={f1s:.3f}")
+
+    res = {
+        "Model": name,
+        "Inference Latency (ms)": latency,
+        "Energy Consumed (Joules)": energy,
+        "F1 Cell Type": round(float(np.mean(fold_f1_t)), 3),
+        "F1 Cell Type SD": round(float(np.std(fold_f1_t)), 3),
+        "F1 Tumor Response": round(float(np.mean(fold_f1_s)), 3),
+        "F1 Tumor Response SD": round(float(np.std(fold_f1_s)), 3),
+    }
+    print(f"   → {name}: cell-type {res['F1 Cell Type']}±{res['F1 Cell Type SD']}, "
+          f"resistance {res['F1 Tumor Response']}±{res['F1 Tumor Response SD']} (GroupKFold mean±SD)")
+    return res, trained_m
+
+
+# --- Define models to evaluate ---
 models_to_test = {
     "Baseline MultiTask": MultiTaskNet,
     "scBERT (Transformer SOTA)": scBERT_Inspired,
@@ -966,11 +1046,15 @@ models_to_test = {
     "Geneformer (Deep GRN)": Geneformer_Inspired
 }
 
-# Ejecución y actualización de la tabla del Benchmark
+# Benchmark execution: GroupKFold cross-validation when --cv-folds > 1, else single split.
+# Note: power monitoring (--power-monitor) applies to the single-split path; CV reports F1 mean±SD.
 results_updated = []
 trained_models = {}
 for name, m_class in models_to_test.items():
-    res, trained_m = train_and_profile_with_energy(m_class, name)
+    if args.cv_folds > 1:
+        res, trained_m = train_and_profile_cv(m_class, name, args.cv_folds)
+    else:
+        res, trained_m = train_and_profile_with_energy(m_class, name)
     results_updated.append(res)
     trained_models[name] = trained_m
 
