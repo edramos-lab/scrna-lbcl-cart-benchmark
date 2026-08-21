@@ -1062,6 +1062,9 @@ df_bench = pd.DataFrame(results_updated)
 df_bench = df_bench.dropna(axis=1, how='all')  # hide power columns unless --power-monitor produced data
 print("\n📊 --- FINAL MULTI-METRIC BENCHMARK TABLE ---")
 show_table(df_bench)
+_bench_csv = os.path.join(args.output_dir, "benchmark_results.csv")
+df_bench.to_csv(_bench_csv, index=False)
+print(f"💾 Benchmark table saved to {_bench_csv} (included in the final output zip).")
 if power_plot_paths:
     print(f"🔌 Per-model training power plots saved ({len(power_plot_paths)}): "
           + ", ".join(os.path.basename(p) for p in power_plot_paths))
