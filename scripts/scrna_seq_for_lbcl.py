@@ -1377,3 +1377,22 @@ else:
             pass
 
 print("\n🎉 Pipeline finished. All figures written to:", os.path.abspath(args.output_dir))
+
+# ============================================================
+#  FINAL STEP: zip the output folder (named after the folder itself) and download it
+# ============================================================
+_out_dir_norm = os.path.normpath(args.output_dir)
+_zip_stem = os.path.basename(_out_dir_norm) or "outputs"          # e.g. "outputs" -> outputs.zip
+_zip_base = os.path.join(os.path.dirname(_out_dir_norm) or ".", _zip_stem)
+_zip_path = shutil.make_archive(_zip_base, "zip", root_dir=_out_dir_norm)
+print(f"🗜️  Zipped output folder -> {_zip_path} ({os.path.getsize(_zip_path) / 1e6:.1f} MB)")
+
+try:
+    from google.colab import files
+    files.download(_zip_path)
+    print(f"⬇️  Downloading {os.path.basename(_zip_path)} via the Colab browser download...")
+except ImportError:
+    print(f"ℹ️  google.colab not available; the zip is saved at {_zip_path}.")
+except Exception as e:
+    print(f"⚠️  Could not trigger the Colab download automatically ({e}). "
+          f"Grab it manually from the file browser: {_zip_path}")
