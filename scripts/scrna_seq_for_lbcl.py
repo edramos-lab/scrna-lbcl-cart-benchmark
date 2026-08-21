@@ -116,6 +116,31 @@ def parse_args():
     an.add_argument("--tsne-perplexity", type=float, default=30.0)
     an.add_argument("--skip-gpu-tsne", action="store_true", help="Skip the RAPIDS/cuML GPU t-SNE step.")
     an.add_argument("--skip-xai", action="store_true", help="Skip Integrated Gradients + cross-analysis.")
+    an.add_argument("--skip-umap-3d", action="store_true",
+                    help="Skip the 3D UMAP embedding CSV export (GPU cuML, CPU umap-learn fallback).")
+    an.add_argument("--umap-n-neighbors", type=int, default=15, help="UMAP n_neighbors parameter.")
+    an.add_argument("--umap-min-dist", type=float, default=0.1, help="UMAP min_dist parameter.")
+
+    sg = p.add_argument_group("pretrained scGPT (real transfer learning, opt-in)")
+    sg.add_argument("--use-pretrained-scgpt", action="store_true",
+                    help="Add a 5th benchmark model: the real bowang-lab/scGPT pretrained "
+                         "foundation model, fine-tuned on this cohort. Requires the 'scgpt' "
+                         "package and a downloaded checkpoint -- these are NOT installed or "
+                         "downloaded by this script; see README for the setup commands to run "
+                         "yourself first.")
+    sg.add_argument("--scgpt-repo-dir", default="./scGPT",
+                    help="Local path to a 'git clone https://github.com/bowang-lab/scGPT.git' "
+                         "checkout, used as an import fallback if 'pip install scgpt' was not used.")
+    sg.add_argument("--scgpt-checkpoint-dir", default=None,
+                    help="Local directory holding the downloaded pretrained checkpoint "
+                         "(must contain args.json, vocab.json, best_model.pt). Required "
+                         "when --use-pretrained-scgpt is set.")
+    sg.add_argument("--scgpt-freeze-backbone", action="store_true",
+                    help="Freeze the pretrained transformer and fine-tune only the new "
+                         "classification heads (faster, lower memory; linear-probe style).")
+    sg.add_argument("--scgpt-n-bins", type=int, default=51,
+                    help="Number of expression-value bins for scGPT's tokenizer "
+                         "(51 matches the original pretraining default).")
 
     out = p.add_argument_group("output")
     out.add_argument("--output-dir", default=".", help="Where figure files are written.")
@@ -351,6 +376,10 @@ sc.pp.log1p(adata)
 # Strict selection of Highly Variable Genes (HVGs) - Keeps your dimensions clean
 sc.pp.highly_variable_genes(adata, min_mean=args.hvg_min_mean, max_mean=args.hvg_max_mean, min_disp=args.hvg_min_disp)
 adata = adata[:, adata.var['highly_variable']].copy()
+# Preserve the non-negative, log-normalized (pre-scaling) matrix. The "-Inspired" models below
+# train on the z-scored matrix (adata.X after sc.pp.scale), but a real pretrained scGPT expects
+# non-negative log-normalized values for its expression-value tokenizer, so we keep both.
+adata.raw = adata
 sc.pp.scale(adata, max_value=args.scale_max)
 
 # --- 4. REAL CLINICAL COHORT LABELS ---
@@ -566,6 +595,155 @@ class Geneformer_Inspired(nn.Module):
         x1 = self.layer1(x)
         x2 = self.layer2(x1) + x1 # Conexión residual nativa
         return self.type_head(x2), self.status_head(x2)
+
+# ==========================================
+# MODEL 5 (OPT-IN): REAL PRETRAINED scGPT (bowang-lab), fine-tuned via transfer learning
+# ==========================================
+class PretrainedScGPTWrapper(nn.Module):
+    """Wraps the real bowang-lab/scGPT pretrained TransformerModel behind the same
+    forward(x) -> (type_logits, status_logits) interface as the "-Inspired" models
+    above, so it plugs into the existing GPU-resident training/eval/GroupKFold loop
+    unchanged.
+
+    UNVERIFIED / BEST-EFFORT: this class is written against the widely-used
+    scGPT fine-tuning tutorial pattern (Tutorial_Annotation.ipynb in the scGPT repo),
+    but the scgpt package's public API (TransformerModel's constructor and forward
+    signature, load_pretrained's module path) has changed across releases, and this
+    integration has NOT been runtime-tested against a real checkpoint (no GPU/scgpt/
+    checkpoint available in the environment that authored this script). If model
+    construction or the forward call fails, the printed error will include exactly
+    what was attempted; report it back so the call can be pinned to your installed
+    scgpt version.
+
+    Important preprocessing caveat: `x` in forward() is the SAME z-scored `X_data`
+    matrix passed to the other four models (so this model needs no changes to the
+    shared training loop), not the non-negative log-normalized matrix scGPT's
+    official tokenizer expects. To sidestep that mismatch, expression values are
+    rank-binned per cell via a vectorized argsort -- which only depends on each
+    gene's relative order within a cell, so it is well-defined on z-scored
+    (possibly negative) input -- rather than scGPT's official magnitude-based
+    binning of non-negative counts. Only the subset of input genes present in
+    scGPT's pretrained vocabulary can be tokenized; the rest are dropped for this
+    model only. For simplicity, EVERY kept gene is tokenized for every cell (no
+    variable-length subsampling or zero-exclusion). `adata.raw` is preserved
+    upstream (pre-scaling) in case a more faithful, magnitude-based tokenization is
+    wired in later. These are pragmatic simplifications of scGPT's official
+    preprocessing, not an exact reproduction -- flagged here so results from this
+    model are interpreted accordingly.
+    """
+    def __init__(self, gene_names, checkpoint_dir, repo_dir=None, n_bins=51,
+                freeze_backbone=False, device="cuda"):
+        super().__init__()
+        if not checkpoint_dir or not os.path.isdir(checkpoint_dir):
+            raise FileNotFoundError(
+                f"--scgpt-checkpoint-dir '{checkpoint_dir}' does not exist. It must be a local "
+                f"directory containing args.json, vocab.json, and best_model.pt, downloaded "
+                f"from the scGPT 'Pretrained Model Zoo' (see README for the exact steps).")
+
+        try:
+            import scgpt  # noqa: F401  (import used only to trigger the ImportError branch below)
+        except ImportError:
+            if repo_dir and os.path.isdir(repo_dir):
+                if repo_dir not in sys.path:
+                    sys.path.insert(0, repo_dir)
+            else:
+                raise ImportError(
+                    "The 'scgpt' package is not importable and --scgpt-repo-dir does not point "
+                    "to a valid clone of https://github.com/bowang-lab/scGPT.git. Install scgpt "
+                    "or clone the repo first -- see README for the exact commands (not run by "
+                    "this script).")
+
+        from scgpt.tokenizer.gene_tokenizer import GeneVocab
+        from scgpt.model import TransformerModel
+        import json
+
+        vocab_file = os.path.join(checkpoint_dir, "vocab.json")
+        args_file = os.path.join(checkpoint_dir, "args.json")
+        model_file = os.path.join(checkpoint_dir, "best_model.pt")
+        missing = [f for f in (vocab_file, args_file, model_file) if not os.path.exists(f)]
+        if missing:
+            raise FileNotFoundError(f"Missing expected scGPT checkpoint file(s): {missing}")
+
+        self.vocab = GeneVocab.from_file(vocab_file)
+        self.pad_token = "<pad>"
+        self.pad_value = -2
+        for special in [self.pad_token, "<cls>", "<eoc>"]:
+            if special not in self.vocab:
+                self.vocab.append_token(special)
+        self.n_bins = n_bins
+
+        with open(args_file) as fh:
+            model_configs = json.load(fh)
+
+        # Intersect our HVGs with the pretrained vocabulary; genes absent from the vocab
+        # cannot be tokenized and are dropped for this model only (standard scGPT practice).
+        gene_names = list(gene_names)
+        gene_ids_all = np.array([self.vocab[g] if g in self.vocab else -1 for g in gene_names])
+        self.keep_mask = gene_ids_all >= 0
+        n_kept = int(self.keep_mask.sum())
+        if n_kept == 0:
+            raise ValueError("None of the input HVGs were found in the scGPT pretrained vocabulary; "
+                             "cannot proceed.")
+        print(f"   scGPT vocab match: {n_kept}/{len(gene_names)} HVGs found in the pretrained "
+              f"vocabulary ({n_kept / len(gene_names):.1%}). The remaining genes are dropped "
+              f"for this model only; the other four architectures are unaffected.")
+        self.register_buffer("gene_ids", torch.as_tensor(gene_ids_all[self.keep_mask], dtype=torch.long))
+        self.register_buffer("keep_mask_t", torch.as_tensor(self.keep_mask))
+
+        self.model = TransformerModel(
+            ntoken=len(self.vocab),
+            d_model=model_configs["embsize"],
+            nhead=model_configs["nheads"],
+            d_hid=model_configs["d_hid"],
+            nlayers=model_configs["nlayers"],
+            vocab=self.vocab,
+            pad_token=self.pad_token,
+            pad_value=self.pad_value,
+        )
+        state_dict = torch.load(model_file, map_location="cpu")
+        try:
+            from scgpt.utils import load_pretrained
+            load_pretrained(self.model, state_dict, verbose=False)
+        except ImportError:
+            # scgpt.utils.load_pretrained has moved across releases; fall back to a manual,
+            # shape-matched partial load so mismatched heads in the checkpoint don't crash us.
+            own_state = self.model.state_dict()
+            matched = {k: v for k, v in state_dict.items()
+                      if k in own_state and v.shape == own_state[k].shape}
+            own_state.update(matched)
+            self.model.load_state_dict(own_state, strict=False)
+            print(f"   (fallback weight loading: matched {len(matched)}/{len(state_dict)} tensors "
+                  f"by name and shape; scgpt.utils.load_pretrained was not importable)")
+
+        if freeze_backbone:
+            for p_ in self.model.parameters():
+                p_.requires_grad = False
+
+        d_model = model_configs["embsize"]
+        self.type_head = nn.Linear(d_model, 3)
+        self.status_head = nn.Linear(d_model, 2)
+
+    def _bin_values(self, x_kept):
+        """Vectorized per-cell rank binning into self.n_bins buckets (no Python loop
+        over cells). This only depends on each gene's rank within a cell, so it is
+        robust to the input not being non-negative -- but note it therefore does NOT
+        reproduce scGPT's official zero-value handling (see class docstring)."""
+        ranks = torch.argsort(torch.argsort(x_kept, dim=1), dim=1).float()
+        n_genes = x_kept.shape[1]
+        return (ranks / max(n_genes, 1) * self.n_bins).long().clamp(min=0, max=self.n_bins - 1) + 1
+
+    def forward(self, x):
+        x_kept = x[:, self.keep_mask_t]
+        values = self._bin_values(x_kept)
+        gene_ids_batch = self.gene_ids.unsqueeze(0).expand(x.shape[0], -1)
+        padding_mask = torch.zeros_like(gene_ids_batch, dtype=torch.bool)
+        try:
+            out = self.model(gene_ids_batch, values, src_key_padding_mask=padding_mask, CLS=True)
+        except TypeError:
+            # Older/newer scgpt releases vary on accepting a CLS kwarg; retry without it.
+            out = self.model(gene_ids_batch, values, src_key_padding_mask=padding_mask)
+        cell_emb = out["cell_emb"] if isinstance(out, dict) and "cell_emb" in out else out.mean(dim=1)
+        return self.type_head(cell_emb), self.status_head(cell_emb)
 
 # ============================================================
 #  HYPERPARAMETER SEARCH WITH OPTUNA (TPE sampler + Median pruning)
@@ -1081,6 +1259,36 @@ models_to_test = {
     "Geneformer (Deep GRN)": Geneformer_Inspired
 }
 
+# Optional 5th model: real pretrained scGPT (bowang-lab), opt-in via --use-pretrained-scgpt.
+# Off by default; requires the scgpt package + a downloaded checkpoint (see README) that this
+# script does NOT install or download. Loading is wrapped so a missing/broken setup just skips
+# this model with a clear message instead of crashing the rest of the benchmark.
+if args.use_pretrained_scgpt:
+    try:
+        from functools import partial
+        _scgpt_gene_names = adata.var_names.tolist()
+        _scgpt_partial = partial(
+            PretrainedScGPTWrapper,
+            gene_names=_scgpt_gene_names,
+            checkpoint_dir=args.scgpt_checkpoint_dir,
+            repo_dir=args.scgpt_repo_dir,
+            n_bins=args.scgpt_n_bins,
+            freeze_backbone=args.scgpt_freeze_backbone,
+            device=device,
+        )
+        # Probe-construct once now so a broken setup is reported before the benchmark loop
+        # starts, rather than failing silently deep inside train_and_profile_*.
+        _probe = _scgpt_partial()
+        del _probe
+        models_to_test["scGPT (Pretrained, bowang-lab)"] = lambda input_dim: _scgpt_partial()
+        print("✅ Pretrained scGPT loaded successfully; added as a 5th benchmark model.")
+        run_summary["pretrained_scgpt_checkpoint_dir"] = args.scgpt_checkpoint_dir
+        run_summary["pretrained_scgpt_freeze_backbone"] = args.scgpt_freeze_backbone
+    except Exception as e:
+        print(f"⚠️  Could not load pretrained scGPT ({type(e).__name__}: {e}); "
+              f"continuing the benchmark WITHOUT it. See README for setup instructions, and "
+              f"report this error if the setup steps were already completed.")
+
 # Benchmark execution: GroupKFold cross-validation when --cv-folds > 1, else single split.
 # Note: power monitoring (--power-monitor) applies to the single-split path; CV reports F1 mean±SD.
 results_updated = []
@@ -1169,6 +1377,40 @@ def compute_tsne_2d(X, perplexity=30.0, seed=42, prefer_gpu=True):
     X_pca = skPCA(n_components=n_pca, random_state=seed).fit_transform(X)
     emb = TSNE(n_components=2, perplexity=perplexity, random_state=seed).fit_transform(X_pca)
     return np.asarray(emb), "CPU (sklearn)"
+
+
+# ============================================================
+#  3D UMAP — GPU-accelerated (RAPIDS/cuML) with CPU fallback
+# ============================================================
+def compute_umap_3d(X, n_neighbors=15, min_dist=0.1, seed=42, prefer_gpu=True):
+    """Return (3D embedding as np.ndarray, backend label).
+
+    Tries RAPIDS/cuML's UMAP on GPU when prefer_gpu is True; falls back to the
+    CPU umap-learn package if cuML is unavailable; returns (None, "unavailable")
+    if neither package is installed, so the caller can skip gracefully.
+    """
+    if prefer_gpu:
+        try:
+            import cupy as cp
+            from cuml.manifold import UMAP as cuUMAP
+            print(f"🔮 Computing 3D UMAP on GPU (cuML: n_neighbors={n_neighbors}, min_dist={min_dist})...")
+            X_gpu = cp.asarray(X)
+            emb = cuUMAP(n_components=3, n_neighbors=n_neighbors, min_dist=min_dist,
+                        random_state=seed).fit_transform(X_gpu)
+            emb = emb.get() if hasattr(emb, "get") else np.asarray(emb)
+            return np.asarray(emb), "GPU (cuML)"
+        except Exception as e:
+            print(f"⚠️  GPU UMAP unavailable ({e}); trying CPU umap-learn.")
+    try:
+        from umap import UMAP as skUMAP
+        print(f"🖥️  Computing 3D UMAP on CPU (umap-learn: n_neighbors={n_neighbors}, min_dist={min_dist})...")
+        emb = skUMAP(n_components=3, n_neighbors=n_neighbors, min_dist=min_dist,
+                     random_state=seed).fit_transform(X)
+        return np.asarray(emb), "CPU (umap-learn)"
+    except Exception as e:
+        print(f"⚠️  UMAP unavailable on GPU or CPU ({e}); skipping the 3D UMAP CSV export. "
+              f"Install 'umap-learn' (CPU) or RAPIDS cuML (GPU) to enable it.")
+        return None, "unavailable"
 
 
 def save_combined_tsne_plot(embeddings, cell_types, tumor_status, out_dir, backend=""):
@@ -1355,6 +1597,35 @@ if args.auto_download:
         print("ℹ️  google.colab not available; figures are saved to --output-dir instead.")
 else:
     print(f"ℹ️  Figures saved to '{args.output_dir}'. Pass --auto-download to trigger Colab browser downloads.")
+
+# ============================================================
+#  3D UMAP embedding CSV (for later interactive visualization, e.g. plotly)
+# ============================================================
+# This step ONLY exports the embedding + labels as a CSV; it does not render a
+# plot. Load the CSV later with something like:
+#   import plotly.express as px, pandas as pd
+#   df = pd.read_csv("umap_3d.csv")
+#   fig = px.scatter_3d(df, x="UMAP_1", y="UMAP_2", z="UMAP_3", color="Cell_Type")
+#   fig.update_traces(marker=dict(size=2, opacity=0.7)); fig.show()
+if args.skip_umap_3d:
+    print("⏭️  --skip-umap-3d set: skipping the 3D UMAP embedding CSV export.")
+else:
+    umap_3d_embeddings, umap_backend = compute_umap_3d(
+        X_data, n_neighbors=args.umap_n_neighbors, min_dist=args.umap_min_dist,
+        seed=args.seed, prefer_gpu=not args.skip_gpu_tsne)
+    if umap_3d_embeddings is not None:
+        df_umap = pd.DataFrame(umap_3d_embeddings, columns=["UMAP_1", "UMAP_2", "UMAP_3"])
+        df_umap["Cell_Type"] = adata.obs["cell_type_mapped"].values
+        df_umap["Tumor_Response"] = adata.obs["tumor_status_mapped"].values
+        df_umap["Is_Outlier"] = adata.obs["is_outlier"].values
+        df_umap["Patient"] = adata.obs["patient_num"].values
+        _umap_csv = os.path.join(args.output_dir, "umap_3d.csv")
+        df_umap.to_csv(_umap_csv, index=False)
+        print(f"✅ 3D UMAP computed on {umap_backend}; saved {len(df_umap):,} rows to {_umap_csv} "
+              f"(included in the final output zip).")
+        run_summary["umap_3d_backend"] = umap_backend
+        run_summary["umap_n_neighbors"] = args.umap_n_neighbors
+        run_summary["umap_min_dist"] = args.umap_min_dist
 
 import scipy.stats as stats
 import seaborn as sns

@@ -26,9 +26,10 @@ main.pdf
 
 # --- Pipeline outputs (figures, generated at runtime) ---
 outputs/
-images/*.png
-images/*.pdf
-images/*.svg
+images/**/*.png
+images/**/*.pdf
+images/**/*.svg
+images/**/*.csv
 
 # --- Optuna study / model artifacts ---
 *.db

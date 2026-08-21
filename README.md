@@ -38,7 +38,72 @@ python scripts/scrna_seq_for_lbcl.py \
 
 Key flags: `--gpu-power-watts` (T4=70, V100=300, A100=400), `--tune-model`, `--n-trials`,
 `--skip-download` (reuse data on re-runs), `--power-monitor`, `--skip-gpu-tsne`,
-`--response-csv`. Run `python scripts/scrna_seq_for_lbcl.py --help` for the full list.
+`--response-csv`, `--skip-umap-3d`. Run `python scripts/scrna_seq_for_lbcl.py --help` for the full list.
+
+### 3D UMAP embedding CSV
+
+Every run (unless `--skip-umap-3d` is passed) computes a 3D UMAP embedding of the full cohort
+(GPU via RAPIDS cuML, falling back to CPU `umap-learn`, or skipped with a warning if neither is
+installed) and saves it as `umap_3d.csv` (`UMAP_1/2/3`, `Cell_Type`, `Tumor_Response`, `Is_Outlier`,
+`Patient`) in `--output-dir`. This only exports the data — no plot is rendered on the server — so you
+can build the interactive 3D view yourself later, e.g.:
+
+```python
+import pandas as pd, plotly.express as px
+df = pd.read_csv("umap_3d.csv")
+fig = px.scatter_3d(df, x="UMAP_1", y="UMAP_2", z="UMAP_3", color="Cell_Type")
+fig.update_traces(marker=dict(size=2, opacity=0.7))
+fig.show()
+```
+
+Tune with `--umap-n-neighbors` (default 15) and `--umap-min-dist` (default 0.1).
+
+### Optional: real pretrained scGPT (transfer learning, opt-in)
+
+The four benchmark architectures are compact "-Inspired" networks trained from scratch. Passing
+`--use-pretrained-scgpt` adds a genuine 5th model: the real [bowang-lab/scGPT](https://github.com/bowang-lab/scGPT)
+foundation-model checkpoint, fine-tuned on this cohort. This is a best-effort integration written
+against the scGPT fine-tuning tutorial pattern; it has **not** been runtime-tested against a real
+checkpoint (no GPU/`scgpt`/checkpoint were available while writing it). If it errors, please share
+the traceback so the call can be pinned to your installed `scgpt` version.
+
+**Setup — run these yourself before using `--use-pretrained-scgpt` (not run by the script):**
+
+```bash
+# 1. Clone the official scGPT repo
+git clone https://github.com/bowang-lab/scGPT.git
+cd scGPT
+
+# 2. Install scGPT and its dependencies (Python 3.9/3.10 + a CUDA-enabled torch build recommended)
+pip install scgpt
+# -- or, to install from the freshly cloned source instead of PyPI:
+# pip install -e .
+
+# 3. Download a pretrained checkpoint from the "Pretrained scGPT Model Zoo" table in the scGPT
+#    repo's README (e.g. the "whole-human" checkpoint) and unzip it locally. The folder must
+#    contain exactly: args.json, vocab.json, best_model.pt
+cd ..
+```
+
+**Run the pipeline pointing at both locations:**
+
+```bash
+python scripts/scrna_seq_for_lbcl.py \
+  --use-pretrained-scgpt \
+  --scgpt-repo-dir ./scGPT \
+  --scgpt-checkpoint-dir /path/to/unzipped/checkpoint \
+  --response-csv patient_response.csv --skip-download
+```
+
+Other flags: `--scgpt-freeze-backbone` (linear-probe: freeze the pretrained transformer, train only
+the new classification heads; faster and lower memory) and `--scgpt-n-bins` (expression-value
+tokenizer bins, default 51, matching the original pretraining).
+
+**Known limitation:** only the pretrained model's own gene vocabulary can be tokenized, so HVGs
+absent from it are dropped for this model only (a match-rate is printed at load time), and
+expression values are rank-binned per cell (robust to our already-z-scored input) rather than
+reproducing scGPT's official magnitude-based binning of raw counts — a pragmatic simplification,
+not an exact reproduction of the original preprocessing.
 
 ### Labels (important)
 
