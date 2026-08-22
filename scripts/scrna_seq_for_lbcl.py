@@ -141,6 +141,12 @@ def parse_args():
     sg.add_argument("--scgpt-n-bins", type=int, default=51,
                     help="Number of expression-value bins for scGPT's tokenizer "
                          "(51 matches the original pretraining default).")
+    sg.add_argument("--scgpt-only", action="store_true",
+                    help="Benchmark ONLY the pretrained scGPT model: skip the four from-scratch "
+                         "architectures and the Optuna hyperparameter search entirely (which "
+                         "targets those architectures, not the pretrained one). Requires "
+                         "--use-pretrained-scgpt. Useful for quickly iterating on the pretrained "
+                         "integration without re-running the rest of the benchmark each time.")
 
     out = p.add_argument_group("output")
     out.add_argument("--output-dir", default=".", help="Where figure files are written.")
@@ -153,6 +159,16 @@ def parse_args():
 
 
 args = parse_args()
+
+if args.scgpt_only and not args.use_pretrained_scgpt:
+    raise SystemExit("❌ --scgpt-only requires --use-pretrained-scgpt (nothing else would run). "
+                     "Add --use-pretrained-scgpt --scgpt-checkpoint-dir <path> to your command.")
+if args.scgpt_only and not args.skip_search:
+    # The Optuna search tunes one of the four from-scratch architectures (--tune-model), which
+    # --scgpt-only excludes from the run entirely, so the search has nothing to do here.
+    print("ℹ️  --scgpt-only set: forcing --skip-search (Optuna tunes a from-scratch architecture, "
+          "not the pretrained model).")
+    args.skip_search = True
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 torch.manual_seed(args.seed)
@@ -1285,9 +1301,22 @@ if args.use_pretrained_scgpt:
         run_summary["pretrained_scgpt_checkpoint_dir"] = args.scgpt_checkpoint_dir
         run_summary["pretrained_scgpt_freeze_backbone"] = args.scgpt_freeze_backbone
     except Exception as e:
+        if args.scgpt_only:
+            # The user explicitly asked to run ONLY the pretrained model; silently falling back
+            # to the four from-scratch architectures would contradict that, so fail loudly here
+            # instead of deep inside the benchmark loop.
+            raise SystemExit(f"❌ --scgpt-only was set but pretrained scGPT failed to load "
+                             f"({type(e).__name__}: {e}). See README for setup instructions.")
         print(f"⚠️  Could not load pretrained scGPT ({type(e).__name__}: {e}); "
               f"continuing the benchmark WITHOUT it. See README for setup instructions, and "
               f"report this error if the setup steps were already completed.")
+
+# --scgpt-only: drop the four from-scratch architectures, keeping only the pretrained model
+# (already validated above that --use-pretrained-scgpt is set and loading succeeded, or this
+# script would already have exited).
+if args.scgpt_only:
+    models_to_test = {"scGPT (Pretrained, bowang-lab)": models_to_test["scGPT (Pretrained, bowang-lab)"]}
+    print("🎯 --scgpt-only set: benchmarking ONLY the pretrained scGPT model.")
 
 # Benchmark execution: GroupKFold cross-validation when --cv-folds > 1, else single split.
 # Note: power monitoring (--power-monitor) applies to the single-split path; CV reports F1 mean±SD.
@@ -1482,12 +1511,26 @@ except Exception as e:
     print(f"ℹ️  Skipping interactive plotly view ({e}); the static anomaly map below still runs.")
 
 df_xai = None
+# Prefer scBERT (matches the paper's figures/captions); fall back to whichever model actually
+# ran if scBERT isn't in this run's model set (e.g. --scgpt-only).
+_ig_target_name = "scBERT (Transformer SOTA)" if "scBERT (Transformer SOTA)" in trained_models \
+    else next(iter(trained_models), None)
 if args.skip_xai:
     print("⏭️  --skip-xai set: skipping Integrated Gradients feature attribution.")
+elif _ig_target_name is None:
+    print("⏭️  No trained model available for Integrated Gradients; skipping.")
+elif "Pretrained" in _ig_target_name:
+    # The pretrained wrapper's internal tokenizer (argsort-based rank binning) is
+    # non-differentiable, so Integrated Gradients cannot backpropagate through it to the
+    # continuous input -- attributions would be meaningless (near-zero) noise, not a real
+    # explanation. Skip rather than report a misleading result.
+    print(f"⏭️  Skipping Integrated Gradients for '{_ig_target_name}': its input tokenizer "
+          f"(rank-based binning) is non-differentiable, so gradient-based attribution on the "
+          f"raw input is not meaningful for this model.")
 else:
-    print("🧠 Extracting biological explainability using Captum (Integrated Gradients)...")
-    # Tomamos el modelo campeón scBERT para auditar qué genes pesan más en sus decisiones
-    target_model = trained_models["scBERT (Transformer SOTA)"].to(device)
+    print(f"🧠 Extracting biological explainability using Captum (Integrated Gradients) on "
+          f"'{_ig_target_name}'...")
+    target_model = trained_models[_ig_target_name].to(device)
     target_model.eval()
 
     # Captum needs a function that returns a single Tensor, not a tuple

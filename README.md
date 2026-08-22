@@ -99,6 +99,20 @@ Other flags: `--scgpt-freeze-backbone` (linear-probe: freeze the pretrained tran
 the new classification heads; faster and lower memory) and `--scgpt-n-bins` (expression-value
 tokenizer bins, default 51, matching the original pretraining).
 
+**Iterating quickly:** add `--scgpt-only` to skip the four from-scratch architectures and the
+Optuna search entirely, and benchmark *only* the pretrained model (useful while debugging the
+integration, since you don't want to wait through the other four every time). Requires
+`--use-pretrained-scgpt`; fails fast with a clear message if the checkpoint doesn't load, rather
+than silently falling back to the other four.
+
+```bash
+python scripts/scrna_seq_for_lbcl.py \
+  --use-pretrained-scgpt --scgpt-only \
+  --scgpt-repo-dir ./scGPT \
+  --scgpt-checkpoint-dir /path/to/unzipped/checkpoint \
+  --response-csv patient_response.csv --skip-download
+```
+
 **Known limitation:** only the pretrained model's own gene vocabulary can be tokenized, so HVGs
 absent from it are dropped for this model only (a match-rate is printed at load time), and
 expression values are rank-binned per cell (robust to our already-z-scored input) rather than
